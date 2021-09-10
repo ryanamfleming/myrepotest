@@ -1,0 +1,196 @@
+---
+title: "Prep August 31st 2021 Set of KITE and ABA2 single-cell data"
+author: "Jim Kaminski"
+date: "`r Sys.Date()`"
+output: tint::tintHtml
+bibliography: skeleton.bib
+link-citations: yes
+---
+
+This Rmarkdown script steps through the process for preparing KITE samples to be added to the Sample table, and processed by the cellranger_multi WDL.
+
+Each sequencing submission tends to be a little different (different library types may be added, sometimes multiple datasets are combined in a sequencing run and need to be separated like KITE and ABA2, etc.), so this script will likely not work on new submissions. Hopefully, though, it'll illustrate the general principles and contain some useful commands.
+
+```{r setup, include=FALSE}
+# Please install these packages if they are not already present.
+library(tint)        
+library(tidyverse)
+library(AnVIL)
+library(readxl)
+library(janitor)
+library(Biostrings)
+
+cdir_KITE <- "gs://kean_lab_data/KITE/data/sequencing/C1-136_2021-08-28_2021-08-29/"
+cdir_ABA2 <- ""
+```
+
+
+
+```{r configure_terra, include=F}
+# These commands connect to Jim's Shalek Lab account and workspace. You might need to change them. 
+avworkspace_namespace("shalek-lab-firecloud")
+avworkspace_name("KITE_CART")
+```
+
+```{r copy_broad_submission_sheet}
+# This just copies the Excel sheet from the workspace to your local RStudio instance. You may need to change the local path.
+
+gsutil_cp("gs://fc-e4d5e91a-9554-4b43-b80f-4b2324277520/data/broad_submission_sheets/2021_08_31_Submission__SK-4MVD_Broad_WUS__20210827_RF_Final.xls",
+          "/home/rstudio/Projects/myrepotest/Data/")
+```
+
+```{r Merge_Sample_Info_Onto_List_OF_Fastq_Files}
+
+# Read off the list of Excel sheets in this folder.
+readxl::excel_sheets("/home/rstudio/Projects/myrepotest/Data/2021_08_31_Submission__SK-4MVD_Broad_WUS__20210827_RF_Final.xls")
+
+# Parsing data from Excel can be a little tricky. If you open up that Excel sheet, 
+# the Broad's format allocated three columns per sample. To make it easier to parse, 
+# I wrote a function below that loads three columns at a time.
+
+Load_Samples_From_Submission_Sheet <- function(iCol){
+  # Reads in three columns of Excel sheet, starting at
+  # "iCol", saves them in a tibble.
+  
+  # Load three columns
+  tbIndexes <- readxl::read_xls("/home/rstudio/Projects/myrepotest/Data/2021_08_31_Submission__SK-4MVD_Broad_WUS__20210827_RF_Final.xls",sheet="Index Information",skip=1) %>%
+    janitor::clean_names() %>% 
+    .[iCol:(iCol+2)]
+  
+  # Give these columns informative names.
+  colnames(tbIndexes) <-c("sample_name","Index1","Index2")
+  
+  # Add Lane Information
+  tbIndexes <- tbIndexes %>% mutate(Lane=round(iCol/3+1) %>% as.character())
+  return(tbIndexes)
+}
+
+# Get the four sets of libraries, combine into one big 'tibble'.
+tbIndices <- c(1,4,7,10) %>% 
+  purrr::map(Load_Samples_From_Submission_Sheet) %>% 
+  purrr::reduce(rbind) %>% 
+  filter(!is.na(sample_name))
+
+
+# In the Broad filenames, Index2 is the reverse complement of what we have in the
+# sheet, so we need to convert one to match the other. I take the RC of I2 in our
+# submission sheet.
+tbIndices <- tbIndices %>%  rowwise() %>%
+  mutate(Index1=str_trim(Index1),Index2=str_trim(Index2) %>% Biostrings::DNAString(.) %>% Biostrings::reverseComplement(.) %>% as.character(.))
+```
+
+```{r Get_List_of_Fastqs_From_Broad}
+# Here, we make another tibble *tbFastqs* that is a big list of all the fastqs
+# we have for this KITE sequencing run. We are then going to merge it onto 
+# *tbIndices* so we can connect sample names to fastqs.
+
+# Prep Fastqs
+
+# Get Big List of files.
+tbFastqs <- tibble(fastq=gsutil_ls("gs://kean_lab_data/KITE/data/sequencing/C1-136_2021-08-28_2021-08-29/*.fastq.gz")) 
+
+# Extract Indices and Lane from each filename.
+tbFastqs <- tbFastqs%>% mutate(Index1 = basename(fastq) %>% str_match(.,"([ATGC]{10})_") %>% .[,2],
+                   Index2 = basename(fastq) %>% str_match(.,"\\_([ATGC]{10})") %>% .[,2],
+                   Lane =  basename(fastq) %>% str_split(.,"\\.",simplify=T) %>%.[,2])
+
+colnames(tbIndices)
+
+# Merge the fastq info onto the submission sheet info. 
+tbMerged <- tbIndices %>% inner_join(tbFastqs,by=c("Index1","Index2","Lane"))
+
+# Check to see if any did not match. (Normally, this should be empty, but we should see ABA2 samples here.)
+tbUnmatched_Indices <- tbIndices %>% anti_join(tbFastqs,by=c("Index1","Index2","Lane"))
+
+# I also usually check in the other direction - did any fastqs not map to the indices?
+tbUnmatched_Fastqs <- tbFastqs %>% anti_join(tbIndices,by=c("Index1","Index2","Lane"))
+```
+
+At this stage, we should have each fastq file matched to the appropriate sample. 
+However, we still need to take care of some things.
+
+1) Our samples are still separated by library type (GEX, VDJ, CITE-Seq)
+2) For each library type, we need to make a tsv file that lists all of the fastq
+files, and have them organized such that the columns are R1, R2, I1, and I2.
+
+```{r Prep_tsv_files}
+
+# (I am leaving out what the commands here are doing, but can explain when we meet,
+# or point you to help files.)
+
+# Reorganize the fastqs into 'wide' mode - list R1,R2,I1,I2 for each sample-library
+# combination.
+
+tbWide <- tbMerged %>% dplyr::select(sample_name,fastq) %>%
+  # Identify each fastq file as R1, R2, I1, or I2.
+  mutate(read_type = case_when(grepl("unmapped.1.fastq.gz",fastq) ~ "R1",
+                                          grepl("unmapped.2.fastq.gz",fastq) ~ "R2",
+                                          grepl("barcode_1.fastq.gz",fastq) ~ "I1",
+                                          grepl("barcode_2.fastq.gz",fastq) ~ "I2")) %>% 
+  dplyr::select(sample_name,fastq,read_type) %>%
+  pivot_wider(names_from="read_type",values_from="fastq")
+
+# Open up tbWide here in RStudio to confirm.
+
+# Add library type to the table
+tbWide <- tbWide %>% mutate(library_type = case_when(grepl("GEX",sample_name) ~ "GEX",
+                                          grepl("VDJ",sample_name) ~ "VDJ",
+                                          grepl("CITE",sample_name) ~ "CITESeq",
+                                          grepl("BCR",sample_name) ~ "BCR")) %>%
+  
+  # Cut out the suffix on the sample name that indicates library type.
+  mutate(sample_name= str_replace_all(sample_name," ",""),
+         sample_stem = str_replace_all(sample_name,"_GEX|_VDJ|_BCR|_CITEseq","")) %>%
+  
+  # Make names of tsvFile that will contain these lists of files.
+  mutate(tsvFile_Local = paste0("/home/rstudio/Projects/myrepotest/Data/tmp/",sample_name,".tsv"))
+
+table(duplicated(tbWide$tsvFile_Local))
+
+Make_tsv_File <- function(tsvFile){
+  # This function takes in a tsvFile name as input, then filters the table
+  # to write the R1,R2,I1,I2 filenames to that tsvFile. 
+  
+  tbFiles <- tbWide %>% filter(tsvFile_Local==tsvFile) %>% dplyr::select(R1,R2,I1,I2)
+  write_tsv(tbFiles,tsvFile,col_names=F)
+  
+}
+
+tbWide$tsvFile_Local %>% unique() %>% purrr::map(Make_tsv_File)
+
+  
+# Copy these tsvFiles to the appropriate location.
+tbWide <- tbWide %>% mutate(tsvFile_GS =if_else( grepl("KITE",sample_name), cdir_KITE,cdir_ABA2) )
+
+tbWide %>%dplyr::select(tsvFile_Local,tsvFile_GS) %>% unique()
+
+
+
+# Uncomment and run this line to actually copy the files over
+# purrr::map2(tbWide$tsvFile_Local,tbWide$tsvFile_GS,.f=CopyFile)
+
+
+```
+
+
+We now have our 'list of lists' tsvFiles for each library type (GEX, VDJ, and CITE-Seq), for each sample.
+Our next step is to organize this information into the same format that we have on Terra.
+
+
+```{make_metadata_file}
+# Double check that nothing is missing/unusual
+tbWide %>% filter(is.na(library_type))
+
+
+tbMetadata <- tbWide %>% mutate(tsvFile=paste0(tsvFile_GS,basename(tsvFile_Local))) %>% dplyr::select(sample_stem,tsvFile,library_type) %>%
+  pivot_wider(id_cols="sample_stem",names_from="library_type",values_from="tsvFile",values_fill="")
+
+# Rename the columns to Terra's names.
+tbMetadata %>%dplyr::rename(`entity:sample_id`=sample_stem,tsvGEX=GEX,tsvVDJ=VDJ,tsvABs=CITESeq) %>% write_tsv(.,"New_SampleSheet.tsv")
+gsutil_cp("New_SampleSheet.tsv","gs://fc-2e1d3a7b-bdba-45fd-9069-7c34108d6c94/New_SampleSheet.tsv")
+```
+
+Next, we look at this sheet. I think we need to rename the sample_id column to something like 'entity:sample', and will check when we meet.
+
+
+While we're on Zoom, we should also make sure that we are not missing any fastq files.
